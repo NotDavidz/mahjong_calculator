@@ -36,6 +36,12 @@ MELD_MAP = {
     "kan": Meld.KAN,
     "shouminkan": Meld.SHOUMINKAN
 }
+HONOR_MAP = {
+    "ton": "1", "nan": "2", "shaa": "3", "pei": "4",
+    "haku": "5", "hatsu": "6", "chun": "7"
+}
+
+SUIT_MAP = {"m": "man", "p": "pin", "s": "sou"}
 
 class MeldModel(BaseModel):
     meld_type: str    # "pon", "chi", "kan", "shouminkan"
@@ -57,6 +63,9 @@ class HandRequest(BaseModel):
     # Game Context
     is_tsumo: bool = False
     is_riichi: bool = False
+    is_double_riichi: bool = False # NEW
+    is_ippatsu: bool = False       # NEW
+    is_under_the_sea: bool = False # NEW
     seat_wind: str = "east"
     round_wind: str = "east"
     
@@ -78,11 +87,15 @@ def is_sequential(t1, t2, t3):
         return False
         
     try:
+        v1 = 5 if t1[0] == '0' else int(t1[0])
+        v2 = 5 if t2[0] == '0' else int(t2[0])
+        v3 = 5 if t3[0] == '0' else int(t3[0])
         # Check if the numbers are consecutive (e.g., 3, 4, 5)
-        v1, v2, v3 = int(t1[0]), int(t2[0]), int(t3[0])
-        return v1 + 1 == v2 and v2 + 1 == v3
+        vals = sorted([v1, v2, v3])
+        return vals[0] + 1 == vals[1] and vals[1] + 1 == vals[2]
     except ValueError:
         return False
+    
 def get_all_valid_parses(tokens):
     all_valid_parses = []
 
@@ -131,6 +144,70 @@ def get_all_valid_parses(tokens):
     backtrack(tokens, [])
     return all_valid_parses
 
+def translate_yolo_to_mahjong(yolo_tiles):
+    """
+    Converts a list of YOLO tile strings (e.g., ['1s', '2s', '0p', 'hatsu'])
+    into suit strings for the mahjong library.
+    """
+    suits = {"m": "", "p": "", "s": "", "z": ""}
+    
+    for tile in yolo_tiles:
+        if tile == "back":
+            continue
+
+        if tile in HONOR_MAP:
+            suits["z"] += HONOR_MAP[tile]
+        else:
+            # e.g., '1s' -> value '1', suit 's'
+            # e.g., '0p' -> value '0' (Red 5), suit 'p'
+            value = tile[0] 
+            suit = tile[1]  
+            suits[suit] += value
+            
+    # Sort the strings so "312" becomes "123"
+    suits["m"] = "".join(sorted(suits["m"]))
+    suits["p"] = "".join(sorted(suits["p"]))
+    suits["s"] = "".join(sorted(suits["s"]))
+    suits["z"] = "".join(sorted(suits["z"]))
+    
+    return suits
+
+def format_nfa_meld_for_api(meld_dict):
+    """
+    Translates NFA output -> MeldModel format for the calculator.
+    Example: {"type": "chi", "tiles": ["1s", "2s", "3s"], "is_open": True} 
+          -> {"meld_type": "chi", "suit": "sou", "tiles": "123", "is_open": True}
+    """
+    raw_tiles = meld_dict["tiles"]
+    meld_type = meld_dict["type"]
+    is_open = meld_dict["is_open"]
+    
+    # 1. Handle Ankan (strip the 'back' tiles so we can read the suit)
+    visible_tiles = [t for t in raw_tiles if t != "back"]
+    sample_tile = visible_tiles[0] 
+    
+    # 2. Extract Suit and Tile Numbers
+    if sample_tile in HONOR_MAP:
+        suit = "honors"
+        tiles_str = "".join([HONOR_MAP[t] for t in visible_tiles])
+    else:
+        suit_char = sample_tile[-1]
+        suit = SUIT_MAP[suit_char]
+        tiles_str = "".join([t[0] for t in visible_tiles]) # Gets the numbers
+        
+    # 3. Ensure Kans have 4 characters (Ankan only has 2 visible tiles, so we duplicate)
+    if meld_type in ["kan", "ankan"]:
+        tiles_str = tiles_str[0] * 4
+        
+    # 4. Normalize Ankan to "kan" (The API uses is_open=False to know it's Ankan)
+    api_meld_type = "kan" if meld_type == "ankan" else meld_type
+    
+    return {
+        "meld_type": api_meld_type,
+        "suit": suit,
+        "tiles": "".join(sorted(tiles_str)), # Ensure "213" becomes "123"
+        "is_open": is_open
+    }
 
 #Calculate points
 @app.post("/calculate")
@@ -177,9 +254,14 @@ def calculate_hand(req: HandRequest):
         config = HandConfig(
             is_tsumo=req.is_tsumo,
             is_riichi=req.is_riichi,
+            is_daburu_riichi=req.is_double_riichi, # NEW
+            is_ippatsu=req.is_ippatsu,             # NEW
+            # NEW: Mahjong library uses Haitei for Tsumo, Houtei for Ron
+            is_haitei=req.is_under_the_sea and req.is_tsumo,   
+            is_houtei=req.is_under_the_sea and not req.is_tsumo, 
             player_wind=WIND_MAP.get(req.seat_wind, EAST),
             round_wind=WIND_MAP.get(req.round_wind, EAST),
-            options=OptionalRules(has_aka_dora=True) # Enables Red 5s (passed as "0")
+            options=OptionalRules(has_aka_dora=True) 
         )
         
         # Calculate the scores
@@ -239,11 +321,22 @@ async def analyze_image(file: UploadFile = File(...)):
         if not detected_tiles:
             raise HTTPException(status_code=400, detail="No tiles detected.")
 
-        # 4. The Y-Axis Slicer
-        avg_y = sum(t["y_center"] for t in detected_tiles) / len(detected_tiles)
-        
-        top_row = [t for t in detected_tiles if t["y_center"] < avg_y]
-        bottom_row = [t for t in detected_tiles if t["y_center"] >= avg_y]
+        # 4. The Y-Axis Slicer & Concealed Hand Check
+        y_coords = [t["y_center"] for t in detected_tiles]
+        min_y = min(y_coords)
+        max_y = max(y_coords)
+        vertical_spread = max_y - min_y
+
+        if vertical_spread < 300: 
+            # The spread is too small to be two rows. The WHOLE HAND IS CONCEALED.
+            top_row = detected_tiles
+            bottom_row = []
+            avg_y = None
+        else:
+            # The spread is large. THERE ARE TWO ROWS.
+            avg_y = sum(y_coords) / len(y_coords)
+            top_row = [t for t in detected_tiles if t["y_center"] < avg_y]
+            bottom_row = [t for t in detected_tiles if t["y_center"] >= avg_y]
 
         # 5. Sort Rows by X-Coordinate (Left to Right)
         top_row.sort(key=lambda t: t["x_center"])
@@ -251,14 +344,25 @@ async def analyze_image(file: UploadFile = File(...)):
 
         # 6. Feed bottom row to the Multi-Parse NFA
         # This will return a list of valid configurations (usually length 1)
-        valid_meld_configurations = get_all_valid_parses(bottom_row)
+        raw_meld_configurations = get_all_valid_parses(bottom_row)
+        
+        # Format melds for the API (e.g. {"type": "chi", ...} -> {"meld_type": "chi", "suit": "sou", ...})
+        formatted_meld_configurations = []
+        for configuration in raw_meld_configurations:
+            formatted_config = [format_nfa_meld_for_api(meld) for meld in configuration]
+            formatted_meld_configurations.append(formatted_config)
+
+        # 7. Translate the closed hand for the API
+        top_row_names = [t["name"] for t in top_row]
+        parsed_closed_hand = translate_yolo_to_mahjong(top_row_names)
 
         return {
             "status": "success",
-            "closed_hand_raw": [t["name"] for t in top_row],
-            "bottom_row_raw": [t["name"] for t in bottom_row], # NEW: See exactly what the NFA is trying to parse
-            "meld_options": valid_meld_configurations,
-            "requires_user_disambiguation": len(valid_meld_configurations) > 1,
+            "closed_hand_raw": top_row_names,
+            "closed_hand_parsed": parsed_closed_hand, # NEW: Returns {"m": "", "p": "789", "s": "", "z": "33666"}
+            "bottom_row_raw": [t["name"] for t in bottom_row], 
+            "meld_options": formatted_meld_configurations, # NEW: Returns API-ready melds!
+            "requires_user_disambiguation": len(formatted_meld_configurations) > 1,
             
             # --- DEEP DEBUGGING INFO ---
             "debug_y_axis_split": avg_y,
@@ -273,3 +377,24 @@ async def analyze_image(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def main():
+    pass
+
+if __name__ == "__main__":
+    main()
