@@ -50,30 +50,24 @@ class MeldModel(BaseModel):
     is_open: bool   
 
 class HandRequest(BaseModel):
-    # The closed hand separated by suit type
     closed_man: str = ""
     closed_pin: str = ""
     closed_sou: str = ""
     closed_honors: str = ""
-    
-    # The winning tile
     win_tile_value: str
     win_tile_suit: str
-    
-    # Game Context
     is_tsumo: bool = False
     is_riichi: bool = False
-    is_double_riichi: bool = False # NEW
-    is_ippatsu: bool = False       # NEW
-    is_under_the_sea: bool = False # NEW
+    is_double_riichi: bool = False 
+    is_ippatsu: bool = False       
+    is_under_the_sea: bool = False 
+    is_kan_win: bool = False            # NEW
+    is_first_turn_win: bool = False     # NEW
     seat_wind: str = "east"
     round_wind: str = "east"
-    
-    # Dora Indicators
-    dora_man: str = ""
-    dora_pin: str = ""
-    dora_sou: str = ""
-    dora_honors: str = ""
+    honba: int = 0                      # NEW
+    dora_indicators: List[str] = []     # NEW
+    ura_dora_indicators: List[str] = [] # NEW
     
     melds: List[MeldModel] = []
 
@@ -185,7 +179,13 @@ def format_nfa_meld_for_api(meld_dict):
     # 1. Handle Ankan (strip the 'back' tiles so we can read the suit)
     visible_tiles = [t for t in raw_tiles if t != "back"]
     sample_tile = visible_tiles[0] 
-    
+
+    if not visible_tiles:
+        sample_tile = "haku"
+        visible_tiles = ["haku", "haku"] # Spoof the missing inner faces
+    else:
+        sample_tile = visible_tiles[0]
+
     # 2. Extract Suit and Tile Numbers
     if sample_tile in HONOR_MAP:
         suit = "honors"
@@ -239,54 +239,89 @@ def calculate_hand(req: HandRequest):
                 )
             )
             
-        # Dora
-        dora_indicators = TilesConverter.string_to_136_array(
-            man=req.dora_man,
-            pin=req.dora_pin,
-            sou=req.dora_sou,
-            honors=req.dora_honors,
-            has_aka_dora=True
-        )
-        if not dora_indicators:
-            dora_indicators = None
-            
         # Context
+        player_wind = WIND_MAP.get(req.seat_wind, EAST)
+        
+        # NEW: Helper to convert dora strings ("1m", "5p", "3z") to 136 format
+        def parse_dora(dora_list):
+            res = []
+            for d in dora_list:
+                val, suit = d[0], d[1]
+                if suit == 'm': res.append(TilesConverter.string_to_136_array(man=val)[0])
+                elif suit == 'p': res.append(TilesConverter.string_to_136_array(pin=val)[0])
+                elif suit == 's': res.append(TilesConverter.string_to_136_array(sou=val)[0])
+                elif suit == 'z': res.append(TilesConverter.string_to_136_array(honors=val)[0])
+            return res
+
+        # NEW: Combine and parse all dora indicators
+        all_dora_136 = parse_dora(req.dora_indicators) + parse_dora(req.ura_dora_indicators)
+
         config = HandConfig(
             is_tsumo=req.is_tsumo,
             is_riichi=req.is_riichi,
-            is_daburu_riichi=req.is_double_riichi, # NEW
-            is_ippatsu=req.is_ippatsu,             # NEW
-            # NEW: Mahjong library uses Haitei for Tsumo, Houtei for Ron
+            is_daburu_riichi=req.is_double_riichi,
+            is_ippatsu=req.is_ippatsu,
             is_haitei=req.is_under_the_sea and req.is_tsumo,   
-            is_houtei=req.is_under_the_sea and not req.is_tsumo, 
-            player_wind=WIND_MAP.get(req.seat_wind, EAST),
+            is_houtei=req.is_under_the_sea and not req.is_tsumo,
+            is_rinshan=req.is_kan_win and req.is_tsumo,                               
+            is_chankan=req.is_kan_win and not req.is_tsumo,                           
+            is_tenhou=req.is_first_turn_win and req.is_tsumo and player_wind == EAST, 
+            is_chiihou=req.is_first_turn_win and req.is_tsumo and player_wind != EAST, # FIXED
+            is_renhou=req.is_first_turn_win and not req.is_tsumo,                     
+            player_wind=player_wind,
             round_wind=WIND_MAP.get(req.round_wind, EAST),
             options=OptionalRules(has_aka_dora=True) 
         )
         
-        # Calculate the scores
+        # Calculate the scores (passing new Dora format)
         result = calculator.estimate_hand_value(
             tiles=tiles, 
             win_tile=win_tile, 
             melds=mahjong_melds, 
-            dora_indicators=dora_indicators, 
+            dora_indicators=all_dora_136 if all_dora_136 else None, 
             config=config
         )
         
         if result.error:
             return {"status": "error", "message": result.error}
             
+        # NEW: Apply Honba sticks (300 points total per stick)
+        honba_bonus = req.honba * 300
+        main_points = result.cost['main']
+        add_points = result.cost.get('additional', 0)
+        
+        if req.is_tsumo:
+            if player_wind == EAST:
+                main_points += int(honba_bonus / 3) # Dealer pays 1/3 per player
+            else:
+                main_points += int(honba_bonus / 3) # Dealer portion
+                add_points += int(honba_bonus / 3)  # Non-dealer portion
+        else:
+            main_points += honba_bonus # Ron payer pays all Honba
+
+        # --- NEW: Format Yaku with their dynamic Han values ---
+        is_hand_open = any(m.is_open for m in req.melds)
+        formatted_yaku = []
+        for yaku in result.yaku:
+            if getattr(yaku, 'is_yakuman', False):
+                han_val = "Yakuman"
+            else:
+                han_val = yaku.han_open if is_hand_open else yaku.han_closed
+            # Pass the raw integer to the frontend so it can be translated!
+            formatted_yaku.append({"name": yaku.name, "han": han_val})
+        # ------------------------------------------------------
+
         return {
             "status": "success",
             "han": result.han,
             "fu": result.fu,
-            "points": result.cost['main'],
-            "additional_points": result.cost.get('additional', 0),
-            "yaku": [yaku.name for yaku in result.yaku],
+            "points": main_points,
+            "additional_points": add_points,
+            "yaku": formatted_yaku,
         }
         
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return {"status": "error", "message": f"Game state error: {str(e)}. Check for impossible combinations (e.g., 5 of the same tile)."}
 
 
 
@@ -337,6 +372,17 @@ async def analyze_image(file: UploadFile = File(...)):
             avg_y = sum(y_coords) / len(y_coords)
             top_row = [t for t in detected_tiles if t["y_center"] < avg_y]
             bottom_row = [t for t in detected_tiles if t["y_center"] >= avg_y]
+
+        # --- SAFETY PATCH: Prevent empty array crashes ---
+        if not top_row and bottom_row:
+            # If everything fell into the bottom row, fallback to treating them as the hand
+            top_row = bottom_row
+            bottom_row = []
+        # ------------------------------------------------
+
+        # 5. Sort Rows by X-Coordinate (Left to Right)
+        top_row.sort(key=lambda t: t["x_center"])
+        bottom_row.sort(key=lambda t: t["x_center"])
 
         # 5. Sort Rows by X-Coordinate (Left to Right)
         top_row.sort(key=lambda t: t["x_center"])
