@@ -353,7 +353,7 @@ export default function IndexScreen() {
     };
 
     try {
-      const response = await fetch('http://192.168.1.177:8000/calculate', {
+      const response = await fetch('https://pavos-riichi-calculator.onrender.com/calculate', {
         method: 'POST',
         headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -419,7 +419,7 @@ export default function IndexScreen() {
     const formData = new FormData();
     formData.append('file', file as any);
 
-    const response = await fetch('http://192.168.1.177:8000/analyze-image', {
+    const response = await fetch('https://pavos-riichi-calculator.onrender.com/analyze-image', {
         method: 'POST', body: formData, headers: { Accept: 'application/json' },
     });
 

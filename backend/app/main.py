@@ -406,18 +406,19 @@ async def analyze_image(file: UploadFile = File(...)):
         if len(indices) > 0:
             for i in indices.flatten():
                 # Scale coordinates back to the original un-padded image resolution
-                orig_x_center = (boxes[i, 0] - pad_w) / ratio
-                orig_y_center = (boxes[i, 1] - pad_h) / ratio
-                orig_w = boxes[i, 2] / ratio
-                orig_h = boxes[i, 3] / ratio
+                # AND CAST TO NATIVE PYTHON TYPES for JSON serialization
+                orig_x_center = float((boxes[i, 0] - pad_w) / ratio)
+                orig_y_center = float((boxes[i, 1] - pad_h) / ratio)
+                orig_w = float(boxes[i, 2] / ratio)
+                orig_h = float(boxes[i, 3] / ratio)
 
-                class_name = CLASS_NAMES[class_ids[i]]
+                class_name = str(CLASS_NAMES[class_ids[i]])
                 
                 detected_tiles.append({
                     "name": class_name,
                     "x_center": orig_x_center,
                     "y_center": orig_y_center,
-                    "is_sideways": orig_w > orig_h
+                    "is_sideways": bool(orig_w > orig_h)
                 })
 
         if not detected_tiles:
@@ -468,7 +469,7 @@ async def analyze_image(file: UploadFile = File(...)):
             "meld_options": formatted_meld_configurations, 
             "requires_user_disambiguation": len(formatted_meld_configurations) > 1,
             
-            "debug_y_axis_split": avg_y,
+            "debug_y_axis_split": float(avg_y) if avg_y is not None else None,
             "debug_raw_detections": [
                 {
                     "name": t["name"], 
