@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { StyleSheet, Text, View, TouchableOpacity, ScrollView, ActivityIndicator, Platform, Switch, Modal } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { File } from 'expo-file-system';
 import { TileIcon } from '@/components/tileIcon';
+import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as ImageManipulator from 'expo-image-manipulator';
 
 const ALL_TILES = [
   '1m','2m','3m','4m','5m','0m','6m','7m','8m','9m',
@@ -118,14 +120,14 @@ const yakuTranslations: Record<string, { en: string; zh: string }> = {
   "Houtei Raoyui": { en: "Under the River (Houtei)", zh: "河底摸鱼" },
   "Rinshan Kaihou": { en: "After a Kan (Rinshan)", zh: "岭上开花" },
   "Chankan": { en: "Robbing a Kan (Chankan)", zh: "枪杠" },
-  "Daburu Riichi": { en: "Double Riichi", zh: "两立直" },
+  "Double Riichi": { en: "Double Riichi", zh: "两立直" },
   "Sanshoku Doujun": { en: "Three-Suited Straight (Sanshoku)", zh: "三色同顺" },
   "Sanshoku Doukou": { en: "Three-Suited Triplets", zh: "三色同刻" },
   "San ankou": { en: "Three Concealed Triplets (Sanankou)", zh: "三暗刻" },
   "Ikkitsuukan": { en: "Full Straight (Ittsuu)", zh: "一气贯通" },
   "Chiitoitsu": { en: "Seven Pairs (Chiitoitsu)", zh: "七对子" },
   "Toitoi": { en: "All Triplets (Toitoi)", zh: "对对和" },
-  "Honchantaiyaochuu": { en: "Mixed Outside Hand (Chanta)", zh: "混全带幺九" },
+  "Chantai": { en: "Mixed Outside Hand (Chanta)", zh: "混全带幺九" },
   "San kantsu": { en: "Three Kans (Sankantsu)", zh: "三杠子" },
   "Shousangen": { en: "Little Three Dragons (Shousangen)", zh: "小三元" },
   "Honroutou": { en: "All Terminals and Honors (Honroutou)", zh: "混老头" },
@@ -193,8 +195,10 @@ export default function IndexScreen() {
   const [locale, setLocale] = useState<'en' | 'zh'>('en');
   const t = translations[locale];
 
-  const [step, setStep] = useState<'upload' | 'edit' | 'context' | 'result'>('upload');
+  const [step, setStep] = useState<'upload' | 'camera' | 'edit' | 'context' | 'result'>('upload');
   const [loading, setLoading] = useState(false);
+  const [permission, requestPermission] = useCameraPermissions();
+  const cameraRef = useRef<any>(null);
   
   const [showAddTileModal, setShowAddTileModal] = useState(false);
   const [editableClosedHand, setEditableClosedHand] = useState<string[]>([]);
@@ -229,6 +233,16 @@ export default function IndexScreen() {
     }
   };
 
+  const toggleKanWin = (val: boolean) => {
+    setIsKanWin(val);
+    if (val) setIsUnderTheSea(false);
+  };
+
+  const toggleUnderTheSea = (val: boolean) => {
+    setIsUnderTheSea(val);
+    if (val) setIsKanWin(false);
+  };
+
   const removeTile = (indexToRemove: number) => {
     setEditableClosedHand(prev => prev.filter((_, index) => index !== indexToRemove));
   };
@@ -259,11 +273,17 @@ export default function IndexScreen() {
 
   const getYoloNamesFromMeld = (meld: any) => {
     const honorReverseMap: Record<string, string> = { "1": "ton", "2": "nan", "3": "shaa", "4": "pei", "5": "haku", "6": "hatsu", "7": "chun" };
-    return meld.tiles.split('').map((char: string) => {
+    const tiles = meld.tiles.split('').map((char: string) => {
       if (meld.suit === "honors") return honorReverseMap[char];
       const suitChar = meld.suit === "man" ? "m" : meld.suit === "pin" ? "p" : "s";
       return `${char}${suitChar}`;
     });
+    
+    // NEW: Mask outer tiles for Ankans
+    if (!meld.is_open && tiles.length === 4) {
+      return ["back", tiles[1], tiles[2], "back"];
+    }
+    return tiles;
   };
 
   const translateToMahjong = (yoloTiles: string[]) => {
@@ -367,6 +387,31 @@ export default function IndexScreen() {
     }
   };
 
+  const openCamera = async () => {
+    if (!permission?.granted) await requestPermission();
+    setStep('camera');
+  };
+
+  const takePictureAndProcess = async () => {
+    if (!cameraRef.current) return;
+    setLoading(true);
+    try {
+      const photo = await cameraRef.current.takePictureAsync();
+      
+      // Rotate image 90 degrees counter-clockwise so the backend Y-slicer works properly
+      const manipulatedImg = await ImageManipulator.manipulateAsync(
+        photo.uri,
+        [{ rotate: -90 }],
+        { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
+      );
+      
+      await sendImageToBackend(manipulatedImg.uri);
+    } catch (e) {
+      alert(locale === 'zh' ? "拍照失败" : "Failed to capture image");
+      setLoading(false);
+    }
+  };
+
  const sendImageToBackend = async (uri: string) => {
   setLoading(true);
   try {
@@ -423,13 +468,55 @@ const renderHanFuOrYakuman = () => {
         </TouchableOpacity>
       </View>
 
-      {/* PHASE 1: UPLOAD */}
+      {/* PHASE 1: UPLOAD OR CAMERA */}
       {step === 'upload' && (
-        <View style={{ alignItems: 'center' }}>
-          <TouchableOpacity style={styles.button} onPress={pickAndAnalyzeImage} disabled={loading}>
-            <Text style={styles.buttonText}>{loading ? t.analyzing : t.scanButton}</Text>
+        <View style={{ alignItems: 'center', width: '100%' }}>
+          <TouchableOpacity style={[styles.button, { marginBottom: 15, width: '80%', alignItems: 'center' }]} onPress={openCamera} disabled={loading}>
+            <Text style={styles.buttonText}>{loading ? t.analyzing : `${t.scanButton} (Camera)`}</Text>
           </TouchableOpacity>
+          
+          <TouchableOpacity style={[styles.button, { backgroundColor: '#555', width: '80%', alignItems: 'center' }]} onPress={pickAndAnalyzeImage} disabled={loading}>
+            <Text style={styles.buttonText}>{locale === 'zh' ? '从相册上传' : 'Upload from Gallery'}</Text>
+          </TouchableOpacity>
+          
           {loading && <ActivityIndicator size="large" color="#4CAF50" style={{ marginTop: 20 }} />}
+        </View>
+      )}
+
+      {/* PHASE 1.5: CUSTOM CAMERA */}
+      {step === 'camera' && (
+        <View style={styles.cameraContainer}>
+          <CameraView style={styles.camera} ref={cameraRef} facing="back">
+            {/* The Overlay - splits screen when held sideways */}
+            <View style={styles.overlayContainer}>
+              <View style={styles.overlayHalf}>
+                <Text style={styles.overlayText}>{locale === 'zh' ? '副露' : 'Melds'}</Text>
+              </View>
+              <View style={styles.overlayDivider} />
+              <View style={styles.overlayHalf}>
+                <Text style={styles.overlayText}>{locale === 'zh' ? '门前手牌' : 'Concealed Hand'}</Text>
+              </View>
+            </View>
+
+            {/* Shutter Controls */}
+              <View style={styles.cameraControls}>
+                <TouchableOpacity
+                  style={styles.closeCamBtn}
+                  onPress={() => setStep('upload')}
+                >
+                  <Text style={styles.buttonText}>{t.cancel}</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.shutterBtn}
+                  onPress={takePictureAndProcess}
+                >
+                  <View style={styles.shutterInner} />
+                </TouchableOpacity>
+
+                <View style={{ width: 60 }} />
+              </View>
+          </CameraView>
         </View>
       )}
 
@@ -520,12 +607,12 @@ const renderHanFuOrYakuman = () => {
 
             <View style={styles.switchRow}>
               <Text style={styles.label}>{isTsumo ? t.rinshan : t.chankan}</Text>
-              <Switch value={isKanWin} onValueChange={setIsKanWin}/>
+              <Switch value={isKanWin} onValueChange={toggleKanWin}/>
             </View>
             
             <View style={styles.switchRow}>
               <Text style={styles.label}>{isTsumo ? t.haitei : t.houtei}</Text>
-              <Switch value={isUnderTheSea} onValueChange={setIsUnderTheSea}/>
+              <Switch value={isUnderTheSea} onValueChange={toggleUnderTheSea}/>
             </View>
 
             {/* RIICHI BLOCK (HIDDEN IF OPEN) */}
@@ -726,4 +813,16 @@ const styles = StyleSheet.create({
   doraRow: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 5, alignItems: 'center' },
   addDoraBtn: { width: 30, height: 40, backgroundColor: '#444', justifyContent: 'center', alignItems: 'center', borderRadius: 4, marginLeft: 5 },
   addDoraText: { color: '#aaa', fontSize: 20, fontWeight: 'bold' },
+
+  // Camera Styles
+  cameraContainer: { width: '100%', height: 600, borderRadius: 15, overflow: 'hidden', marginBottom: 20 },
+  camera: { flex: 1, justifyContent: 'space-between' },
+  overlayContainer: { flex: 1, flexDirection: 'row' }, 
+  overlayHalf: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.3)' },
+  overlayDivider: { width: 2, backgroundColor: '#FFD700', borderStyle: 'dashed' },
+  overlayText: { color: '#FFF', fontSize: 24, fontWeight: 'bold', transform: [{ rotate: '90deg' }], opacity: 0.7 },
+  cameraControls: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, backgroundColor: 'rgba(0,0,0,0.6)' },
+  shutterBtn: { width: 70, height: 70, borderRadius: 35, backgroundColor: '#FFF', justifyContent: 'center', alignItems: 'center' },
+  shutterInner: { width: 60, height: 60, borderRadius: 30, borderWidth: 2, borderColor: '#000' },
+  closeCamBtn: { backgroundColor: '#d9534f', paddingVertical: 10, paddingHorizontal: 15, borderRadius: 8 },
 });

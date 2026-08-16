@@ -13,12 +13,27 @@ import os
 import cv2
 import numpy as np
 from fastapi import UploadFile, File
-from ultralytics import YOLO
+
+# --- NEW ONNX IMPORTS ---
+import onnxruntime as ort
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "best.pt")
+MODEL_PATH = os.path.join(BASE_DIR, "best.onnx") # Note the .onnx extension!
 
-vision_model = YOLO(MODEL_PATH)
+# --- LOAD ONNX SESSION ---
+ort_session = ort.InferenceSession(MODEL_PATH)
+model_inputs = ort_session.get_inputs()
+input_name = model_inputs[0].name
+
+# --- HARDCODE CLASS NAMES ---
+# These are your 38 classes extracted exactly from your training logs
+CLASS_NAMES = [
+    "0m", "0p", "0s", "1m", "1p", "1s", "2m", "2p", "2s", "3m", "3p", "3s",
+    "4m", "4p", "4s", "5m", "5p", "5s", "6m", "6p", "6s", "7m", "7p", "7s",
+    "8m", "8p", "8s", "9m", "9p", "9s", "back", "chun", "haku", "hatsu",
+    "nan", "pei", "shaa", "ton"
+]
+
 app = FastAPI(title="Mahjong Point Calculator API")
 calculator = HandCalculator()
 app.add_middleware(
@@ -70,6 +85,24 @@ class HandRequest(BaseModel):
     ura_dora_indicators: List[str] = [] # NEW
     
     melds: List[MeldModel] = []
+
+def letterbox_image(img, target_shape=(640, 640), color=(114, 114, 114)):
+    """Resizes image to target shape while maintaining aspect ratio with padding."""
+    shape = img.shape[:2]  # [height, width]
+    r = min(target_shape[0] / shape[0], target_shape[1] / shape[1])
+    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+    
+    dw = (target_shape[1] - new_unpad[0]) / 2  # width padding
+    dh = (target_shape[0] - new_unpad[1]) / 2  # height padding
+
+    if shape[::-1] != new_unpad:  # Resize if needed
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    return img, r, dw, dh
 
 def is_sequential(t1, t2, t3):
     # Mahjong honors (z) and backs cannot form sequences
@@ -324,7 +357,6 @@ def calculate_hand(req: HandRequest):
         return {"status": "error", "message": f"Game state error: {str(e)}. Check for impossible combinations (e.g., 5 of the same tile)."}
 
 
-
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
     try:
@@ -333,84 +365,109 @@ async def analyze_image(file: UploadFile = File(...)):
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # 2. Run YOLO Inference
-        results = vision_model.predict(img, conf=0.3, iou=0.5, agnostic_nms=True)[0]
+        # 2. Pre-process for ONNX
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_padded, ratio, pad_w, pad_h = letterbox_image(img_rgb, target_shape=(640, 640))
         
-        # 3. Extract bounding boxes into a workable dictionary
+        # Convert to float32, normalize, and transpose to Channel-First (CHW)
+        blob = img_padded.astype(np.float32) / 255.0
+        blob = np.transpose(blob, (2, 0, 1))
+        blob = np.expand_dims(blob, axis=0) # Add batch dimension -> (1, 3, 640, 640)
+
+        # 3. Run ONNX Inference
+        outputs = ort_session.run(None, {input_name: blob})
+        predictions = outputs[0][0] # Shape: (42, 8400) - 42 is 4 box coords + 38 classes
+
+        # 4. Post-process (Manual Tensor Math)
+        predictions = np.transpose(predictions) # Swap to (8400, 42) for easier reading
+        
+        boxes = predictions[:, :4]  # First 4 columns are [x_center, y_center, width, height]
+        scores = np.max(predictions[:, 4:], axis=1) # Highest class probability per box
+        class_ids = np.argmax(predictions[:, 4:], axis=1) # The class index that had the highest prob
+
+        # Filter out low confidence detections
+        conf_threshold = 0.3
+        mask = scores > conf_threshold
+        boxes = boxes[mask]
+        scores = scores[mask]
+        class_ids = class_ids[mask]
+
+        # 5. Non-Maximum Suppression (Remove overlapping duplicate boxes)
+        # Convert [x_center, y_center, w, h] to [x_min, y_min, w, h] for OpenCV NMS
+        x_min = boxes[:, 0] - (boxes[:, 2] / 2)
+        y_min = boxes[:, 1] - (boxes[:, 3] / 2)
+        boxes_cv = np.column_stack([x_min, y_min, boxes[:, 2], boxes[:, 3]]).tolist()
+        scores_cv = scores.tolist()
+        
+        indices = cv2.dnn.NMSBoxes(boxes_cv, scores_cv, score_threshold=0.3, nms_threshold=0.5)
+
+        # 6. Extract the final accepted bounding boxes
         detected_tiles = []
-        for box in results.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            cls_id = int(box.cls[0].item())
-            class_name = vision_model.names[cls_id]
-            
-            width = x2 - x1
-            height = y2 - y1
-            
-            detected_tiles.append({
-                "name": class_name,
-                "x_center": (x1 + x2) / 2,
-                "y_center": (y1 + y2) / 2,
-                "is_sideways": width > height # Our tie-breaker boolean
-            })
+        if len(indices) > 0:
+            for i in indices.flatten():
+                # Scale coordinates back to the original un-padded image resolution
+                orig_x_center = (boxes[i, 0] - pad_w) / ratio
+                orig_y_center = (boxes[i, 1] - pad_h) / ratio
+                orig_w = boxes[i, 2] / ratio
+                orig_h = boxes[i, 3] / ratio
+
+                class_name = CLASS_NAMES[class_ids[i]]
+                
+                detected_tiles.append({
+                    "name": class_name,
+                    "x_center": orig_x_center,
+                    "y_center": orig_y_center,
+                    "is_sideways": orig_w > orig_h
+                })
 
         if not detected_tiles:
             raise HTTPException(status_code=400, detail="No tiles detected.")
 
-        # 4. The Y-Axis Slicer & Concealed Hand Check
+        # --- The rest of your exact grouping logic remains unchanged ---
+        
+        # 7. The Y-Axis Slicer & Concealed Hand Check
         y_coords = [t["y_center"] for t in detected_tiles]
         min_y = min(y_coords)
         max_y = max(y_coords)
         vertical_spread = max_y - min_y
 
         if vertical_spread < 300: 
-            # The spread is too small to be two rows. The WHOLE HAND IS CONCEALED.
             top_row = detected_tiles
             bottom_row = []
             avg_y = None
         else:
-            # The spread is large. THERE ARE TWO ROWS.
             avg_y = sum(y_coords) / len(y_coords)
             top_row = [t for t in detected_tiles if t["y_center"] < avg_y]
             bottom_row = [t for t in detected_tiles if t["y_center"] >= avg_y]
 
-        # --- SAFETY PATCH: Prevent empty array crashes ---
         if not top_row and bottom_row:
-            # If everything fell into the bottom row, fallback to treating them as the hand
             top_row = bottom_row
             bottom_row = []
-        # ------------------------------------------------
 
-        # 5. Sort Rows by X-Coordinate (Left to Right)
+        # 8. Sort Rows by X-Coordinate (Left to Right)
         top_row.sort(key=lambda t: t["x_center"])
         bottom_row.sort(key=lambda t: t["x_center"])
 
-        # 5. Sort Rows by X-Coordinate (Left to Right)
-        top_row.sort(key=lambda t: t["x_center"])
-        bottom_row.sort(key=lambda t: t["x_center"])
-
-        # 6. Feed bottom row to the Multi-Parse NFA
-        # This will return a list of valid configurations (usually length 1)
+        # 9. Feed bottom row to the Multi-Parse NFA
         raw_meld_configurations = get_all_valid_parses(bottom_row)
         
-        # Format melds for the API (e.g. {"type": "chi", ...} -> {"meld_type": "chi", "suit": "sou", ...})
         formatted_meld_configurations = []
         for configuration in raw_meld_configurations:
             formatted_config = [format_nfa_meld_for_api(meld) for meld in configuration]
             formatted_meld_configurations.append(formatted_config)
 
-        # 7. Translate the closed hand for the API
+        # 10. Translate the closed hand for the API
         top_row_names = [t["name"] for t in top_row]
         parsed_closed_hand = translate_yolo_to_mahjong(top_row_names)
 
         return {
             "status": "success",
             "closed_hand_raw": top_row_names,
-            "closed_hand_parsed": parsed_closed_hand, # NEW: Returns {"m": "", "p": "789", "s": "", "z": "33666"}
+            "closed_hand_parsed": parsed_closed_hand, 
             "bottom_row_raw": [t["name"] for t in bottom_row], 
-            "meld_options": formatted_meld_configurations, # NEW: Returns API-ready melds!
+            "meld_options": formatted_meld_configurations, 
             "requires_user_disambiguation": len(formatted_meld_configurations) > 1,
             
-            # --- DEEP DEBUGGING INFO ---
             "debug_y_axis_split": avg_y,
             "debug_raw_detections": [
                 {
@@ -423,7 +480,6 @@ async def analyze_image(file: UploadFile = File(...)):
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 
 
