@@ -21,7 +21,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "best.onnx") # Note the .onnx extension!
 
 # --- LOAD ONNX SESSION ---
-ort_session = ort.InferenceSession(MODEL_PATH)
+session_options = ort.SessionOptions()
+
+# 2. Force ONNX to use exactly 1 thread to prevent Render CPU throttling
+session_options.intra_op_num_threads = 1
+session_options.inter_op_num_threads = 1
+session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+# 3. Load the model with these new restricted options
+ort_session = ort.InferenceSession(MODEL_PATH, sess_options=session_options)
 model_inputs = ort_session.get_inputs()
 input_name = model_inputs[0].name
 

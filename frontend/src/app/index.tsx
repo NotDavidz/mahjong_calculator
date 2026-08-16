@@ -380,10 +380,22 @@ export default function IndexScreen() {
     let result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
       allowsEditing: false,
-      quality: 1,
+      quality: 1, // We let ImageManipulator handle the compression below
     });
+    
     if (!result.canceled) {
-      await sendImageToBackend(result.assets[0].uri);
+      setLoading(true);
+      try {
+        // Shrink the gallery image before sending!
+        const manipulatedImg = await ImageManipulator.manipulateAsync(
+          result.assets[0].uri,
+          [{ resize: { width: 1080 } }], // Shrink it down
+          { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG }
+        );
+        await sendImageToBackend(manipulatedImg.uri);
+      } catch (e) {
+        setLoading(false);
+      }
     }
   };
 
@@ -401,8 +413,8 @@ export default function IndexScreen() {
       // Rotate image 90 degrees counter-clockwise so the backend Y-slicer works properly
       const manipulatedImg = await ImageManipulator.manipulateAsync(
         photo.uri,
-        [{ rotate: -90 }],
-        { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG }
+        [{ rotate: -90 }, { resize: { width: 1080 } }], // Resize width to 1080px max
+        { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG } // Compress to 50%
       );
       
       await sendImageToBackend(manipulatedImg.uri);
