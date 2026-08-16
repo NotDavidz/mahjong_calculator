@@ -45,7 +45,7 @@ env/
 *.pt
 *.pth
 *.onnx
-
+!backend/app/best.onnx
 # YOLO training output
 runs/
 runs/**/
