@@ -409,12 +409,10 @@ async def analyze_image(file: UploadFile = File(...)):
         
         indices = cv2.dnn.NMSBoxes(boxes_cv, scores_cv, score_threshold=0.3, nms_threshold=0.5)
 
-        # 6. Extract the final accepted bounding boxes
+       # 6. Extract the final accepted bounding boxes
         detected_tiles = []
         if len(indices) > 0:
             for i in indices.flatten():
-                # Scale coordinates back to the original un-padded image resolution
-                # AND CAST TO NATIVE PYTHON TYPES for JSON serialization
                 orig_x_center = float((boxes[i, 0] - pad_w) / ratio)
                 orig_y_center = float((boxes[i, 1] - pad_h) / ratio)
                 orig_w = float(boxes[i, 2] / ratio)
@@ -426,21 +424,24 @@ async def analyze_image(file: UploadFile = File(...)):
                     "name": class_name,
                     "x_center": orig_x_center,
                     "y_center": orig_y_center,
+                    "height": orig_h,            # <-- NEW: Track height for dynamic scaling
                     "is_sideways": bool(orig_w > orig_h)
                 })
 
         if not detected_tiles:
             raise HTTPException(status_code=400, detail="No tiles detected.")
 
-        # --- The rest of your exact grouping logic remains unchanged ---
-        
-        # 7. The Y-Axis Slicer & Concealed Hand Check
+        # 7. The Y-Axis Slicer & Concealed Hand Check (DYNAMIC SCALE)
         y_coords = [t["y_center"] for t in detected_tiles]
         min_y = min(y_coords)
         max_y = max(y_coords)
         vertical_spread = max_y - min_y
+        
+        # Calculate the average height of a tile in THIS specific image
+        avg_tile_height = sum(t["height"] for t in detected_tiles) / len(detected_tiles)
 
-        if vertical_spread < 300: 
+        # If the spread is less than 1.5x the height of a tile, it's a single row.
+        if vertical_spread < (avg_tile_height * 1.5): 
             top_row = detected_tiles
             bottom_row = []
             avg_y = None
@@ -448,11 +449,7 @@ async def analyze_image(file: UploadFile = File(...)):
             avg_y = sum(y_coords) / len(y_coords)
             top_row = [t for t in detected_tiles if t["y_center"] < avg_y]
             bottom_row = [t for t in detected_tiles if t["y_center"] >= avg_y]
-
-        if not top_row and bottom_row:
-            top_row = bottom_row
-            bottom_row = []
-
+            
         # 8. Sort Rows by X-Coordinate (Left to Right)
         top_row.sort(key=lambda t: t["x_center"])
         bottom_row.sort(key=lambda t: t["x_center"])
