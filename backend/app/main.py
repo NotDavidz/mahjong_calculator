@@ -13,6 +13,7 @@ import os
 import cv2
 import numpy as np
 from fastapi import UploadFile, File
+import logging
 
 # --- NEW ONNX IMPORTS ---
 import onnxruntime as ort
@@ -20,6 +21,12 @@ import onnxruntime as ort
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "best.onnx") # Note the .onnx extension!
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("mahjong-api")
 # --- LOAD ONNX SESSION ---
 session_options = ort.SessionOptions()
 
@@ -30,6 +37,8 @@ session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
 # 3. Load the model with these new restricted options
 ort_session = ort.InferenceSession(MODEL_PATH, sess_options=session_options)
+logger.info("MODEL INPUT SHAPE: %s", ort_session.get_inputs()[0].shape)
+logger.info("MODEL OUTPUT SHAPE: %s", ort_session.get_outputs()[0].shape)
 model_inputs = ort_session.get_inputs()
 input_name = model_inputs[0].name
 
@@ -368,10 +377,25 @@ def calculate_hand(req: HandRequest):
 @app.post("/analyze-image")
 async def analyze_image(file: UploadFile = File(...)):
     try:
+        logger.info("=== ANALYZE IMAGE START ===")
+        logger.info("Filename: %s", file.filename)
         # 1. Read image file into OpenCV
         contents = await file.read()
+        logger.info("Received image: %d bytes", len(contents))
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not decode uploaded image."
+            )
+
+        logger.info(
+            "Decoded image: width=%d height=%d",
+            img.shape[1],
+            img.shape[0],
+        )
 
         # 2. Pre-process for ONNX
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -382,10 +406,15 @@ async def analyze_image(file: UploadFile = File(...)):
         blob = np.transpose(blob, (2, 0, 1))
         blob = np.expand_dims(blob, axis=0) # Add batch dimension -> (1, 3, 640, 640)
 
+        logger.info("Running ONNX inference")
         # 3. Run ONNX Inference
         outputs = ort_session.run(None, {input_name: blob})
         predictions = outputs[0][0] # Shape: (42, 8400) - 42 is 4 box coords + 38 classes
 
+        logger.info(
+            "ONNX output shape: %s",
+            outputs[0].shape,
+        )
         # 4. Post-process (Manual Tensor Math)
         predictions = np.transpose(predictions) # Swap to (8400, 42) for easier reading
         
@@ -394,7 +423,7 @@ async def analyze_image(file: UploadFile = File(...)):
         class_ids = np.argmax(predictions[:, 4:], axis=1) # The class index that had the highest prob
 
         # Filter out low confidence detections
-        conf_threshold = 0.3
+        conf_threshold = 0.30
         mask = scores > conf_threshold
         boxes = boxes[mask]
         scores = scores[mask]
@@ -407,7 +436,31 @@ async def analyze_image(file: UploadFile = File(...)):
         boxes_cv = np.column_stack([x_min, y_min, boxes[:, 2], boxes[:, 3]]).tolist()
         scores_cv = scores.tolist()
         
-        indices = cv2.dnn.NMSBoxes(boxes_cv, scores_cv, score_threshold=0.3, nms_threshold=0.5)
+        max_wh = 4096
+
+        boxes_nms = boxes_cv.copy()
+
+        for i in range(len(boxes_nms)):
+            class_offset = class_ids[i] * max_wh
+            boxes_nms[i][0] += class_offset
+            boxes_nms[i][1] += class_offset
+
+        indices = cv2.dnn.NMSBoxes(
+            boxes_nms,
+            scores_cv,
+            score_threshold=conf_threshold,
+            nms_threshold=0.5
+        )
+
+        logger.info(
+            "Detections after confidence filter: %d",
+            len(boxes),
+        )
+
+        logger.info(
+            "Detections after NMS: %d",
+            len(indices),
+        )
 
        # 6. Extract the final accepted bounding boxes
         detected_tiles = []
@@ -422,38 +475,89 @@ async def analyze_image(file: UploadFile = File(...)):
                 
                 detected_tiles.append({
                     "name": class_name,
+                    "confidence": float(scores[i]),
                     "x_center": orig_x_center,
                     "y_center": orig_y_center,
-                    "height": orig_h,            # <-- NEW: Track height for dynamic scaling
-                    "is_sideways": bool(orig_w > orig_h)
+                    "width": orig_w,
+                    "height": orig_h,
+                    "is_sideways": bool(orig_w > orig_h),
                 })
 
+        logger.info(
+            "FINAL TILES: %s",
+            [
+                f"{t['name']}@{t['confidence']:.2f}"
+                for t in detected_tiles
+            ],
+        )
+        
         if not detected_tiles:
             raise HTTPException(status_code=400, detail="No tiles detected.")
 
-        # 7. The Y-Axis Slicer & Concealed Hand Check (DYNAMIC SCALE)
-        y_coords = [t["y_center"] for t in detected_tiles]
-        min_y = min(y_coords)
-        max_y = max(y_coords)
-        vertical_spread = max_y - min_y
-        
-        # Calculate the average height of a tile in THIS specific image
-        avg_tile_height = sum(t["height"] for t in detected_tiles) / len(detected_tiles)
+       # 7. The Y-Axis Slicer & Concealed Hand Check
+# Find the largest vertical gap between detected tiles.
+# This is more robust than splitting at the average Y coordinate.
 
-        # If the spread is less than 1.5x the height of a tile, it's a single row.
-        if vertical_spread < (avg_tile_height * 1.5): 
-            top_row = detected_tiles
+        sorted_by_y = sorted(
+            detected_tiles,
+            key=lambda t: t["y_center"]
+        )
+
+        if len(sorted_by_y) < 2:
+            top_row = sorted_by_y
             bottom_row = []
             avg_y = None
         else:
-            avg_y = sum(y_coords) / len(y_coords)
-            top_row = [t for t in detected_tiles if t["y_center"] < avg_y]
-            bottom_row = [t for t in detected_tiles if t["y_center"] >= avg_y]
-            
+            # Calculate gaps between consecutive Y coordinates
+            gaps = [
+                sorted_by_y[i + 1]["y_center"] - sorted_by_y[i]["y_center"]
+                for i in range(len(sorted_by_y) - 1)
+            ]
+
+            largest_gap_index = int(np.argmax(gaps))
+            largest_gap = gaps[largest_gap_index]
+
+            # Calculate average tile height for this image
+            avg_tile_height = (
+                sum(t["height"] for t in sorted_by_y)
+                / len(sorted_by_y)
+            )
+
+            # If the largest gap is too small to represent separate rows,
+            # treat the image as a single row.
+            if largest_gap < (avg_tile_height * 0.75):
+                top_row = sorted_by_y
+                bottom_row = []
+                avg_y = None
+            else:
+                # Split immediately around the largest vertical gap
+                top_row = sorted_by_y[:largest_gap_index + 1]
+                bottom_row = sorted_by_y[largest_gap_index + 1:]
+
+                # Store the actual boundary between the two rows
+                avg_y = (
+                    top_row[-1]["y_center"]
+                    + bottom_row[0]["y_center"]
+                ) / 2
+
         # 8. Sort Rows by X-Coordinate (Left to Right)
         top_row.sort(key=lambda t: t["x_center"])
         bottom_row.sort(key=lambda t: t["x_center"])
 
+        logger.info(
+            "TOP ROW: %s",
+            [t["name"] for t in top_row],
+        )
+
+        logger.info(
+            "BOTTOM ROW: %s",
+            [t["name"] for t in bottom_row],
+        )
+
+        logger.info(
+            "Y SPLIT: %s",
+            avg_y,
+        )
         # 9. Feed bottom row to the Multi-Parse NFA
         raw_meld_configurations = get_all_valid_parses(bottom_row)
         
@@ -477,15 +581,26 @@ async def analyze_image(file: UploadFile = File(...)):
             "debug_y_axis_split": float(avg_y) if avg_y is not None else None,
             "debug_raw_detections": [
                 {
-                    "name": t["name"], 
-                    "x": round(t["x_center"], 1), 
-                    "y": round(t["y_center"], 1)
-                } for t in detected_tiles
+                    "name": t["name"],
+                    "confidence": round(t["confidence"], 3),
+                    "x": round(t["x_center"], 1),
+                    "y": round(t["y_center"], 1),
+                    "width": round(t["width"], 1),
+                    "height": round(t["height"], 1),
+                }
+                for t in detected_tiles
             ]
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+
+    except Exception:
+        logger.exception("Unhandled error in /analyze-image")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal image processing error.",
+        )
 
 
 

@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "frontend",
+    "name": "Riichi Calculator",
     "slug": "riichi-calculator",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -8,15 +8,10 @@
     "scheme": "frontend",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/images/icon.png"
     },
     "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
-      },
+      "icon": "./assets/images/icon.png",
       "predictiveBackGestureEnabled": false,
       "package": "com.anonymous.frontend"
     },
@@ -32,6 +27,14 @@
           "backgroundColor": "#208AEF",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
+        }
+      ],
+      "expo-camera",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Mahjong Calculator to access your photos.",
+          "savePhotosPermission": "Allow Mahjong Calculator to save photos for AI training."
         }
       ]
     ],
