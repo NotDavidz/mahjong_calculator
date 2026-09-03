@@ -6,9 +6,9 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
 ![ONNX](https://img.shields.io/badge/ONNX-005CED?style=for-the-badge&logo=onnx&logoColor=white)
 
-A full-stack mobile application that uses a custom-trained YOLO object detection model to scan, identify, and calculate complex Japanese Riichi Mahjong hands via device camera.
+A full-stack mobile application that uses a custom-trained YOLO object detection model to scan, identify, and calculate complex Japanese Riichi Mahjong hands via the device camera.
 
-*([Download the latest Android APK here](#) Notice: This app is still in early development, please be aware that there might be potential bugs/display errors)*
+*[Download Link will be avaliable after the backend is transferred from Render to Google Cloud Run](#)*
 
 ---
 
