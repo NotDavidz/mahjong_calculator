@@ -18,6 +18,14 @@ A full-stack mobile application that uses a custom-trained YOLO object detection
 
 ---
 
+## Roboflow Model
+
+In addition to the ONNX model in the repo, here is the training set and model available on Roboflow!
+
+*[Pavos V1.4](https://universe.roboflow.com/david-zhang-4d1vs/riichi-mahjong-tile-recognizer-pavos)*
+
+---
+
 ## ✨ Features
 * **AI-Powered Vision:** Custom-trained YOLO model (exported to ONNX) capable of detecting 34 unique tile classes under varied glare and lighting conditions.
 * **Complex Game Logic Engine:** Calculates complete Japanese Riichi Mahjong game states, including Han, Fu, valid Yaku, Dora/Ura-Dora, and edge-cases like Red 5s (Aka Dora) and Tenhou.
