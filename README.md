@@ -9,7 +9,7 @@
 A full-stack mobile application that uses a custom-trained YOLO object detection model to scan, identify, and calculate complex Japanese Riichi Mahjong hands via the device camera.
 
 Android:
-*[Download Via Expo](https://expo.dev/accounts/lambdev/projects/riichi-calculator/builds/159a32e0-94b7-4f99-8c52-012932a0b4f4)*
+*[Download Via Expo](https://expo.dev/accounts/lambdev/projects/riichi-calculator/builds/949dac8d-ec75-4cf2-8504-9d67f266f2a6)*
 
 iOS support is currently under development :)
 
